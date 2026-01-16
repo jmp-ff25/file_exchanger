@@ -1,116 +1,159 @@
 import ast
-import os
+import pathlib
 import logging
-from pathlib import Path
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
+TARGET_DIR = pathlib.Path("./src/ckr_ai_agent/api")
 LOGGER_METHODS = {"info", "debug", "warning", "error", "success"}
 
 
-class LoggerSessionPatcher(ast.NodeTransformer):
+class SessionIdLoggerPatcher(ast.NodeTransformer):
     def __init__(self):
         self.class_has_session_id = False
+        self.file_modified = False
+
+    # ---------- helpers ----------
+
+    @staticmethod
+    def is_self_attr(node, attr_name: str) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+            and node.attr == attr_name
+        )
+
+    # ---------- class-level ----------
 
     def visit_ClassDef(self, node: ast.ClassDef):
-        # Проверяем, есть ли self.session_id в классе
-        self.class_has_session_id = self._class_defines_session_id(node)
+        self.class_has_session_id = self._detect_session_id(node)
 
         if not self.class_has_session_id:
-            return node  # ничего не трогаем
+            return node  # вообще не трогаем класс
 
         self.generic_visit(node)
         return node
 
+    def _detect_session_id(self, class_node: ast.ClassDef) -> bool:
+        """
+        Проверяем, что в классе реально существует self.session_id:
+        - либо присваивается в __init__
+        - либо объявлен как attribute где-то ещё
+        """
+        for item in class_node.body:
+            if isinstance(item, ast.FunctionDef):
+                for stmt in ast.walk(item):
+                    if isinstance(stmt, ast.Assign):
+                        for target in stmt.targets:
+                            if self.is_self_attr(target, "session_id"):
+                                return True
+        return False
+
+    # ---------- call-level ----------
+
     def visit_Call(self, node: ast.Call):
         """
-        Ищем self.logger.<method>(...)
+        Ищем self.logger.<level>(...)
         """
-        if (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr in LOGGER_METHODS
-            and isinstance(node.func.value, ast.Attribute)
-            and isinstance(node.func.value.value, ast.Name)
-            and node.func.value.value.id == "self"
-            and node.func.value.attr == "logger"
-            and node.args
-            and isinstance(node.args[0], ast.JoinedStr)  # f-string
+        if not self.class_has_session_id:
+            return node
+
+        if not isinstance(node.func, ast.Attribute):
+            return node
+
+        if node.func.attr not in LOGGER_METHODS:
+            return node
+
+        logger_obj = node.func.value
+        if not (
+            isinstance(logger_obj, ast.Attribute)
+            and isinstance(logger_obj.value, ast.Name)
+            and logger_obj.value.id == "self"
+            and logger_obj.attr == "logger"
         ):
-            original_fstring = node.args[0]
+            return node
 
-            # Проверяем, что session_id ещё не добавлен
-            if self._already_contains_session_id(original_fstring):
-                return node
+        if not node.args:
+            return node
 
-            # Добавляем f"{self.session_id} | " в начало
-            new_values = [
-                ast.FormattedValue(
-                    value=ast.Attribute(
-                        value=ast.Name(id="self", ctx=ast.Load()),
-                        attr="session_id",
-                        ctx=ast.Load(),
-                    ),
-                    conversion=-1,
-                ),
-                ast.Constant(value=" | "),
-            ] + original_fstring.values
+        first_arg = node.args[0]
 
-            node.args[0] = ast.JoinedStr(values=new_values)
+        # если session_id уже есть — не трогаем
+        if self._contains_session_id(first_arg):
+            return node
+
+        # модифицируем
+        new_arg = self._prepend_session_id(first_arg)
+        node.args[0] = new_arg
+        self.file_modified = True
 
         return node
 
-    @staticmethod
-    def _already_contains_session_id(fstring: ast.JoinedStr) -> bool:
-        for value in fstring.values:
-            if (
-                isinstance(value, ast.FormattedValue)
-                and isinstance(value.value, ast.Attribute)
-                and value.value.attr == "session_id"
-            ):
-                return True
-        return False
+    # ---------- string handling ----------
 
     @staticmethod
-    def _class_defines_session_id(class_node: ast.ClassDef) -> bool:
-        for node in ast.walk(class_node):
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if (
-                        isinstance(target, ast.Attribute)
-                        and isinstance(target.value, ast.Name)
-                        and target.value.id == "self"
-                        and target.attr == "session_id"
-                    ):
-                        return True
-        return False
+    def _contains_session_id(node) -> bool:
+        return (
+            isinstance(node, ast.JoinedStr)
+            and any(
+                isinstance(v, ast.FormattedValue)
+                and isinstance(v.value, ast.Attribute)
+                and isinstance(v.value.value, ast.Name)
+                and v.value.value.id == "self"
+                and v.value.attr == "session_id"
+                for v in node.values
+            )
+        )
+
+    @staticmethod
+    def _prepend_session_id(node):
+        prefix = ast.JoinedStr(values=[
+            ast.FormattedValue(
+                value=ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr="session_id",
+                    ctx=ast.Load(),
+                ),
+                conversion=-1,
+            ),
+            ast.Constant(value=" | "),
+        ])
+
+        if isinstance(node, ast.JoinedStr):
+            return ast.JoinedStr(values=prefix.values + node.values)
+
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return ast.JoinedStr(values=prefix.values + [node])
+
+        # всё остальное (редкий кейс)
+        return ast.JoinedStr(values=prefix.values + [
+            ast.FormattedValue(value=node, conversion=-1)
+        ])
 
 
-def process_file(path: Path):
+def process_file(path: pathlib.Path):
     source = path.read_text(encoding="utf-8")
-    tree = ast.parse(source)
 
-    patcher = LoggerSessionPatcher()
-    new_tree = patcher.visit(tree)
-    ast.fix_missing_locations(new_tree)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return
 
-    new_source = ast.unparse(new_tree)
+    patcher = SessionIdLoggerPatcher()
+    patcher.visit(tree)
 
-    if new_source != source:
-        path.write_text(new_source, encoding="utf-8")
-        logging.info(f"Пропатчен файл: {path}")
+    if not patcher.file_modified:
+        return  # 🔴 КЛЮЧЕВО: файл вообще не трогаем
+
+    new_source = ast.unparse(tree)
+    path.write_text(new_source, encoding="utf-8")
+    logging.info(f"patched: {path}")
 
 
 def main():
-    root = Path("./src/ckr_ai_agent/api")
-
-    logging.info("Старт патча логов с session_id...")
-    for py_file in root.rglob("*.py"):
-        process_file(py_file)
-    logging.info("Патч завершён!")
+    for file in TARGET_DIR.rglob("*.py"):
+        process_file(file)
 
 
 if __name__ == "__main__":
