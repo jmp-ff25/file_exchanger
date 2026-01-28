@@ -1,14 +1,16 @@
 import re
-from typing import Callable, Optional
+from typing import Callable, Optional, Any
 
 
-SESSION_ID_RE = re.compile(r"\b[a-zA-Z0-9]{16,}\b")
+# Используется ТОЛЬКО для проверки:
+# "уже есть ли session_id в начале сообщения"
+SESSION_ID_IN_MSG_RE = re.compile(r"^[a-zA-Z0-9-]{3,}\s*\|\s*")
 
 
 class LoggerProxy:
     def __init__(
         self,
-        logger,
+        logger: Any,
         owner: object | None = None,
         session_id: Optional[str] = None,
         session_id_provider: Optional[Callable[[], Optional[str]]] = None,
@@ -18,34 +20,55 @@ class LoggerProxy:
         self._explicit_session_id = session_id
         self._session_id_provider = session_id_provider
 
+    # -------------------------
+    # Session ID resolution
+    # -------------------------
+
     def _resolve_session_id(self) -> Optional[str]:
+        # 1. Явно переданный session_id (middleware)
         if self._explicit_session_id:
             return self._explicit_session_id
 
+        # 2. session_id_provider (middleware / функции)
         if self._session_id_provider:
-            return self._session_id_provider()
+            try:
+                return self._session_id_provider()
+            except Exception:
+                return None
 
-        if self._owner:
-            for attr in vars(self._owner).values():
-                if isinstance(attr, str) and SESSION_ID_RE.match(attr):
-                    return attr
+        # 3. owner.session_id (ТОЛЬКО если атрибут так называется)
+        if self._owner and hasattr(self._owner, "session_id"):
+            return getattr(self._owner, "session_id")
 
+        # 4. Никакой эвристики по vars(owner)
         return None
 
-    def _enrich(self, msg: str) -> str:
-        session_id = self._resolve_session_id()
+    # -------------------------
+    # Message enrichment
+    # -------------------------
 
+    def _enrich(self, msg: str) -> str:
+        if not isinstance(msg, str):
+            return msg
+
+        session_id = self._resolve_session_id()
         if not session_id:
             return msg
 
-        if session_id in msg:
+        # Если session_id уже есть в начале сообщения — ничего не делаем
+        if SESSION_ID_IN_MSG_RE.match(msg):
             return msg
 
         return f"{session_id} | {msg}"
 
+    # -------------------------
+    # Proxy mechanics
+    # -------------------------
+
     def __getattr__(self, name: str):
         attr = getattr(self._logger, name)
 
+        # Пробрасываем не-callable атрибуты напрямую
         if not callable(attr):
             return attr
 
@@ -53,9 +76,10 @@ class LoggerProxy:
             if args and isinstance(args[0], str):
                 args = (self._enrich(args[0]),) + args[1:]
 
-            # 🔴 ВАЖНО:
-            # никакого logger.opt()
-            # никакой подмены объекта
+            # ВАЖНО:
+            # - не меняем logger
+            # - не используем opt()
+            # - не ломаем mock
             return attr(*args, **kwargs)
 
         return wrapper
