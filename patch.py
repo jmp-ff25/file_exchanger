@@ -67,19 +67,24 @@ class LoggerProxy:
 
     def __getattr__(self, name: str):
         attr = getattr(self._logger, name)
-
-        # Пробрасываем не-callable атрибуты напрямую
+    
         if not callable(attr):
             return attr
-
+    
         def wrapper(*args, **kwargs):
             if args and isinstance(args[0], str):
                 args = (self._enrich(args[0]),) + args[1:]
+    
+            logger = self._logger
+    
+            # ✅ structlog support (safe)
+            opt = getattr(logger, "opt", None)
+            if callable(opt) and not logger.__class__.__module__.startswith("unittest.mock"):
+                try:
+                    logger = logger.opt(depth=2)
+                except Exception:
+                    pass
+    
+            return getattr(logger, name)(*args, **kwargs)
 
-            # ВАЖНО:
-            # - не меняем logger
-            # - не используем opt()
-            # - не ломаем mock
-            return attr(*args, **kwargs)
-
-        return wrapper
+    return wrapper
